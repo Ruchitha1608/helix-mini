@@ -1,0 +1,4 @@
+# Minimal dependencies for the deterministic eval suite (no API keys required).
+# The guardrail and journey-stage tests only need pydantic — no LLM, STT, or
+# embedding packages are imported on the fast path.
+pydantic==2.7.3

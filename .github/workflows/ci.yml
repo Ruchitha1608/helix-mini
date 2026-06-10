@@ -1,0 +1,29 @@
+name: Eval Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  evals:
+    name: Compliance Evals
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-evals.txt
+
+      - name: Install eval dependencies
+        run: pip install -r requirements-evals.txt
+
+      - name: Run compliance eval suite
+        run: python -m evals.run_evals
+        # Guardrail + journey-stage tests are fully deterministic — no API keys needed.
+        # Add --llm to a separate job with ANTHROPIC_API_KEY secret for LLM quality gates.
