@@ -45,6 +45,16 @@ class EscalationFlag(BaseModel):
     trigger_phrase: str                 # what the patient said
 
 
+class CareTeamFlag(BaseModel):
+    reason: str
+    severity: Literal["low", "medium", "high"]
+
+
+class AppointmentRequest(BaseModel):
+    reason: str
+    preferred_timing: Literal["urgent", "this_week", "routine"]
+
+
 class PostCallSummary(BaseModel):
     session_id: str
     patient_id: str
@@ -67,6 +77,8 @@ class PostCallSummary(BaseModel):
     # Escalation
     escalate_to_human: bool
     escalation_flags: List[EscalationFlag]
+    care_team_flags: List[CareTeamFlag] = []
+    appointment_requests: List[AppointmentRequest] = []
 
     # Latency
     avg_response_latency_ms: Optional[float] = None

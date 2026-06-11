@@ -3,7 +3,7 @@ from typing import Dict, Optional
 from datetime import datetime
 from app.models.session import (
     PostCallSummary, PatientContext, TurnMetrics,
-    ComplianceCitation, EscalationFlag
+    ComplianceCitation, EscalationFlag, CareTeamFlag, AppointmentRequest
 )
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,8 @@ class SessionStore:
             "turns": [],
             "citations": [],
             "escalation_flags": [],
+            "care_team_flags": [],
+            "appointment_requests": [],
             "topics": set(),
             "side_effects": set(),
             "questions": [],
@@ -36,7 +38,9 @@ class SessionStore:
         metrics: TurnMetrics,
         citations: list,
         escalation_flags: list,
-        guardrail_fired: bool
+        guardrail_fired: bool,
+        care_team_flags: list = [],
+        appointment_requests: list = [],
     ):
         if session_id not in self.sessions:
             return
@@ -50,11 +54,13 @@ class SessionStore:
         })
         session["citations"].extend(citations)
         session["escalation_flags"].extend(escalation_flags)
+        session["care_team_flags"].extend(care_team_flags)
+        session["appointment_requests"].extend(appointment_requests)
 
         if guardrail_fired:
             session["guardrail_triggers"] += 1
 
-        if escalation_flags:
+        if escalation_flags or care_team_flags:
             session["escalated"] = True
 
         # Extract topics from patient text
@@ -127,6 +133,8 @@ class SessionStore:
             guardrail_triggers=session["guardrail_triggers"],
             escalate_to_human=session["escalated"],
             escalation_flags=flags,
+            care_team_flags=session["care_team_flags"],
+            appointment_requests=session["appointment_requests"],
             avg_response_latency_ms=avg_latency,
             time_to_first_audio_ms=ttfa
         )

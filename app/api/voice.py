@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 import time
-import uuid
 from fastapi import APIRouter, File, Query, UploadFile, WebSocket, WebSocketDisconnect
 from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 from app.core.config import settings
@@ -37,7 +36,8 @@ async def voice_ws(websocket: WebSocket, session_id: str):
     patient_context = None
     deepgram_client = DeepgramClient(settings.DEEPGRAM_API_KEY)
     dg_connection = None
-    transcript_queue = asyncio.Queue()
+    transcript_queue: asyncio.Queue = asyncio.Queue()
+    transcript_task = None
 
     try:
         # Step 1: receive config
@@ -48,7 +48,6 @@ async def voice_ws(websocket: WebSocket, session_id: str):
             p = config["patient"]
             days = p.get("days_on_treatment", 0)
 
-            # Accept explicit journey_stage or infer from days on treatment
             raw_stage = p.get("journey_stage")
             try:
                 stage = JourneyStage(raw_stage) if raw_stage else infer_stage(days)
@@ -69,8 +68,9 @@ async def voice_ws(websocket: WebSocket, session_id: str):
                 "journey_stage": stage.value,
             }))
 
-        # Step 2: set up Deepgram live transcription
-        dg_connection = deepgram_client.listen.live.v("1")
+        # Step 2: set up Deepgram async live transcription
+        # asynclive is required so start/send/finish are awaitable and callbacks can be async
+        dg_connection = deepgram_client.listen.asynclive.v("1")
 
         async def on_transcript(self, result, **kwargs):
             sentence = result.channel.alternatives[0].transcript
@@ -89,7 +89,7 @@ async def voice_ws(websocket: WebSocket, session_id: str):
         )
         await dg_connection.start(options)
 
-        # Step 3: process audio stream + respond
+        # Step 3: process transcripts and respond — runs concurrently with audio streaming
         async def process_transcripts():
             while True:
                 patient_text = await transcript_queue.get()
@@ -99,12 +99,12 @@ async def voice_ws(websocket: WebSocket, session_id: str):
                 logger.info(f"[{session_id}] Patient: {patient_text}")
                 await websocket.send_text(json.dumps({
                     "type": "transcript",
-                    "text": patient_text
+                    "text": patient_text,
                 }))
 
                 turn_start = time.time()
+                llm_latency_ms = 0.0
 
-                # Check for escalation triggers
                 should_escalate, escalation_flags = guardrail_service.check_patient_input(patient_text)
 
                 if should_escalate:
@@ -112,44 +112,37 @@ async def voice_ws(websocket: WebSocket, session_id: str):
                     guardrail_fired = True
                     citations = []
                 else:
-                    # Get LLM response with RAG
-                    response_text, citations, llm_latency = llm_service.get_response(
+                    response_text, citations, llm_latency_ms, care_team_flags, appointment_requests = llm_service.get_response(
                         session_id=session_id,
                         patient_text=patient_text,
                         drug_name=patient_context.drug_name,
-                        patient_context=patient_context.dict()
+                        patient_context=patient_context.model_dump(),
                     )
-
-                    # Check agent response for compliance violations
                     is_violation, violation_reason = guardrail_service.check_agent_response(response_text)
                     if is_violation:
-                        logger.warning(f"[{session_id}] Guardrail fired: {violation_reason}")
+                        logger.warning(f"[{session_id}] Output guardrail fired: {violation_reason}")
                         response_text = guardrail_service.build_safe_response(violation_reason)
                         guardrail_fired = True
                     else:
                         guardrail_fired = False
 
-                logger.info(f"[{session_id}] Helix: {response_text}")
                 await websocket.send_text(json.dumps({
                     "type": "response",
                     "text": response_text,
-                    "escalate": should_escalate
+                    "escalate": should_escalate,
                 }))
 
-                # TTS
-                tts_start = time.time()
-                audio_bytes, tts_latency = await tts_service.synthesize(response_text)
+                audio_bytes, tts_latency_ms = await tts_service.synthesize(response_text)
                 await websocket.send_bytes(audio_bytes)
 
                 total_latency = (time.time() - turn_start) * 1000
                 metrics = TurnMetrics(
-                    stt_latency_ms=0,  # Deepgram streams, captured separately
-                    llm_latency_ms=llm_latency if not should_escalate else 0,
-                    tts_latency_ms=tts_latency,
+                    stt_latency_ms=0,
+                    llm_latency_ms=llm_latency_ms,
+                    tts_latency_ms=tts_latency_ms,
                     total_latency_ms=total_latency,
-                    guardrail_fired=guardrail_fired
+                    guardrail_fired=guardrail_fired,
                 )
-
                 session_store.add_turn(
                     session_id=session_id,
                     patient_text=patient_text,
@@ -157,14 +150,15 @@ async def voice_ws(websocket: WebSocket, session_id: str):
                     metrics=metrics,
                     citations=citations,
                     escalation_flags=escalation_flags,
-                    guardrail_fired=guardrail_fired
+                    guardrail_fired=guardrail_fired,
+                    care_team_flags=care_team_flags,
+                    appointment_requests=appointment_requests,
                 )
-
-                logger.info(f"[{session_id}] Total turn latency: {total_latency:.0f}ms")
+                logger.info(f"[{session_id}] Turn latency: {total_latency:.0f}ms")
 
         transcript_task = asyncio.create_task(process_transcripts())
 
-        # Step 4: stream audio from client to Deepgram
+        # Step 4: stream client audio to Deepgram
         while True:
             data = await websocket.receive_bytes()
             await dg_connection.send(data)
@@ -176,17 +170,23 @@ async def voice_ws(websocket: WebSocket, session_id: str):
         logger.error(f"[{session_id}] Error: {e}", exc_info=True)
 
     finally:
+        # Signal transcript processor to exit and wait for it to drain
+        await transcript_queue.put("__END__")
+        if transcript_task is not None:
+            try:
+                await asyncio.wait_for(transcript_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                transcript_task.cancel()
+
         if dg_connection:
-            await transcript_queue.put("__END__")
             await dg_connection.finish()
 
-        # Generate and send post-call summary
         summary = session_store.end_session(session_id)
         if summary:
             try:
                 await websocket.send_text(json.dumps({
                     "type": "summary",
-                    "data": summary.dict(default=str)
+                    "data": summary.model_dump(mode="json"),
                 }))
             except Exception:
                 pass
@@ -213,7 +213,6 @@ async def analyze_image(
     image_b64 = base64.b64encode(image_bytes).decode()
     media_type = file.content_type or "image/jpeg"
 
-    # Use session context if available
     patient_context = None
     active = session_store.sessions.get(session_id)
     if active:
@@ -238,7 +237,7 @@ async def analyze_image(
         "drug": drug_name,
         "journey_stage": patient_context.journey_stage.value if patient_context else None,
         "analysis": analysis,
-        "citations": [c.dict() for c in citations],
+        "citations": [c.model_dump() for c in citations],
         "guardrail_fired": is_violation,
         "latency_ms": round(latency_ms),
     }
