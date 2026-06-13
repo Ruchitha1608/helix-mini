@@ -11,3 +11,4 @@ build/
 *.faiss
 data/fda_labels/*.pdf
 !data/fda_labels/lisinopril.pdf
+!data/fda_labels/metformin.pdf

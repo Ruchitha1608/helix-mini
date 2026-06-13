@@ -240,8 +240,8 @@ class LLMService:
         # Agentic loop: run until Claude stops calling tools
         while True:
             response = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=1024,
+                model=settings.CLAUDE_MODEL,
+                max_tokens=300,
                 system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
                 tools=AGENT_TOOLS,
                 messages=self.conversation_history[session_id],
@@ -392,7 +392,7 @@ class LLMService:
             )
 
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model=settings.CLAUDE_MODEL,
             max_tokens=256,
             system=[{"type": "text", "text": IMAGE_ANALYSIS_PROMPT, "cache_control": {"type": "ephemeral"}}],
             messages=[{

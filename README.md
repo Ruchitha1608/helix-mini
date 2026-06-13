@@ -3,47 +3,39 @@
 > A voice AI for the full patient medication journey — compliant, always-on, FDA-grounded.  
 > Built to mirror the core engineering challenges behind Synthio's Helix product.
 
-**Stack:** Python · FastAPI · Deepgram · Cartesia · Claude · FAISS · WebSockets · Docker
+**Stack:** Python · FastAPI · Deepgram STT · Claude Haiku · Cartesia TTS · FAISS · WebSockets · Docker
 
 ---
 
-## The hard part
+## What this is
 
-Building a voice bot that answers drug questions is easy. Building one that's safe to deploy in healthcare is not.
+A production-ready backend for a healthcare voice AI agent. A patient calls in, speaks naturally, and Helix:
 
-Three things make it hard:
+1. Transcribes speech in real time (Deepgram `nova-2-medical`)
+2. Scans for crisis signals before any LLM call — chest pain, breathing difficulty, fainting
+3. Retrieves the top-4 relevant passages from the drug's FDA label (FAISS RAG)
+4. Calls Claude Haiku with stage-appropriate context and FDA grounding
+5. Validates the response before it reaches TTS — blocks dose advice, unauthorized claims
+6. Synthesizes speech (Cartesia `sonic-2`) and streams audio back
+7. Produces a structured post-call summary for care team review
 
-1. **Patients don't talk like label text.** They say "I fainted" not "experienced syncope", "I can't breathe" not "difficulty breathing". A guardrail that only matches canonical phrases misses the real signal — and in healthcare, a miss is a patient safety event.
-
-2. **The system must know where the patient is in their journey.** A day-0 enrollment call ("what is this medication for?") needs a completely different response than a day-90 adherence check ("I've been skipping doses"). One system prompt doesn't cover both.
-
-3. **Every response is a liability.** The agent can't suggest a dose change, make unverified claims, or diagnose a symptom from a photo. Guardrails have to run on both sides — input and output — with fallback responses ready.
-
----
-
-## What this project demonstrates
-
-- **Patient journey state machine** — five stages from enrollment through side-effect monitoring, each driving different system prompts, escalation sensitivity, and response focus
-- **Two-layer compliance guardrails** — input scan (with negation detection) + output validation, tested against 26 deterministic cases
-- **Eval suite that found real bugs on the first run** — 8 missed cases in the original guardrails, fixed before any LLM tests ran
-- **Multimodal image analysis** — patient submits a rash photo mid-session; Claude vision + FDA context + guardrail check returns a structured assessment
-- **Production-ready** — Dockerized, health-checked, CI-safe eval suite with exit code 1 on failure
+Current formulary: **lisinopril** + **metformin**. Any drug with a PDF from [labels.fda.gov](https://labels.fda.gov) can be added by dropping it in `data/fda_labels/`.
 
 ---
 
-## Patient Journey State Machine
+## The hard problems
 
-Helix doesn't just handle one type of call. It tracks where the patient is in their treatment journey and adjusts everything — prompt focus, tone, default topics, escalation threshold — accordingly.
+**1. Patients don't talk like label text.**  
+They say "I fainted" not "experienced syncope", "I can't breathe" not "difficulty breathing". A guardrail that only matches canonical phrases misses the real signal — in healthcare, a miss is a patient safety event.
 
-| Stage | When | What Helix focuses on |
-|---|---|---|
-| `enrollment` | Day 0 | Explain the drug, what to expect, how to take it. Welcoming, confidence-building. |
-| `onboarding` | Days 1–3 | Normalize first experiences. Answer "is this normal?" questions. |
-| `treatment_initiation` | Days 4–14 | Monitor early side effects. Reinforce adherence habit. |
-| `adherence` | Day 15+ | Sustain long-term adherence. Refill planning. Address doubts. |
-| `side_effect_monitoring` | Explicit | Active symptom tracking. Lower escalation threshold. Attentive tone. |
+**2. "I don't have chest pain" should not escalate.**  
+Substring matching triggers on the phrase, not the meaning. Negation detection checks a 25-character window before each match for phrases like "don't", "no", "denies", "not having".
 
-The stage can be passed explicitly in the WebSocket config or auto-inferred from `days_on_treatment`. The `ready` event echoes back the resolved stage so the client knows what mode the session is in.
+**3. The LLM must not improvise.**  
+Every response is grounded in FDA-approved text. If the label doesn't say it, the agent says it doesn't know rather than answering from training data. The output guardrail catches hallucinations before TTS.
+
+**4. Journey stage changes everything.**  
+Day 0 ("what is this medication?") and day 90 ("I've been skipping doses") need completely different prompts, tone, and escalation sensitivity. Stage is auto-inferred from `days_on_treatment` or passed explicitly.
 
 ---
 
@@ -52,7 +44,7 @@ The stage can be passed explicitly in the WebSocket config or auto-inferred from
 ```
 Patient (microphone)
         │
-        ▼  raw PCM audio (WebSocket)
+        ▼  raw PCM 16kHz mono (WebSocket)
 ┌──────────────────────┐
 │   FastAPI Server      │
 │   WebSocket /ws       │
@@ -63,31 +55,32 @@ Patient (microphone)
 ┌──────────────────────┐
 │   Deepgram STT        │
 │   nova-2-medical      │
+│   asynclive + queue   │
 └──────────┬───────────┘
            │  transcript
            ▼
 ┌──────────────────────────────────┐
 │  Layer 1 — Input Guardrail        │
 │  pattern scan + negation check    │
-│  "I can't breathe" → HIGH         │
+│  "I can't breathe"  → HIGH        │
 │  "I don't have chest pain" → skip │
 └──────────┬───────────────────────┘
            │
      HIGH severity?
-     ├─ yes → escalation response (bypasses LLM)
+     ├─ yes → escalation response (LLM bypassed entirely)
      └─ no  ↓
            │
            ▼
 ┌──────────────────────┐
 │   FAISS RAG           │
 │   top-4 FDA passages  │
-│   per patient query   │
+│   sentence-transformers│
 └──────────┬───────────┘
            │
            ▼
 ┌──────────────────────────────────┐
 │   Claude Haiku                    │
-│   base prompt + stage context     │
+│   stage-specific system prompt    │
 │   + FDA passages injected         │
 │   → response + citations          │
 └──────────┬───────────────────────┘
@@ -103,32 +96,41 @@ Patient (microphone)
            ▼
 ┌──────────────────────┐
 │   Cartesia TTS        │
-│   sonic-english       │
+│   sonic-2             │
 └──────────┬───────────┘
            │
            ▼
   audio bytes + JSON events → patient
 
 ON DISCONNECT:
-SessionStore → PostCallSummary JSON
+  SessionStore → PostCallSummary JSON
   adherence_signal · escalation_flags
   compliance_citations · latency metrics
 ```
 
 ---
 
+## Patient Journey State Machine
+
+| Stage | Days | What Helix focuses on |
+|---|---|---|
+| `enrollment` | 0 | Explain the drug, what to expect, how to take it |
+| `onboarding` | 1–3 | Normalize first experiences, answer "is this normal?" |
+| `treatment_initiation` | 4–14 | Monitor early side effects, reinforce habit |
+| `adherence` | 15+ | Sustain long-term adherence, refill planning |
+| `side_effect_monitoring` | explicit | Active symptom tracking, lower escalation threshold |
+
+Stage is auto-inferred from `days_on_treatment` or can be passed explicitly in the WebSocket config.
+
+---
+
 ## Compliance Design
 
-### Layer 1 — Input Scan with Negation Detection
+### Layer 1 — Input Guardrail with Negation Detection
 
-Patient speech is scanned before any LLM call. High-severity matches bypass the LLM entirely and trigger immediate escalation.
-
-Patterns cover natural speech variation — not just the canonical medical term:
+Scans patient speech before any LLM call. High-severity matches bypass the LLM entirely.
 
 ```python
-# "fainted" not just "fainting"
-# "can't breathe" not just "difficulty breathing"
-# "beating irregularly" not just "irregular heartbeat"
 HIGH_SEVERITY_SYMPTOMS = [
     "chest pain", "chest pressure", "chest tightness",
     "can't breathe", "trouble breathing", "shortness of breath",
@@ -139,11 +141,11 @@ HIGH_SEVERITY_SYMPTOMS = [
 ]
 ```
 
-Negation detection prevents false escalation on `"I don't have chest pain"` or `"no shortness of breath"` — a window of 25 characters before each matched phrase is checked for negation prefixes.
+Negation detection prevents false escalation: `"I don't have chest pain"` checks the 25 chars before `"chest pain"` for `"don't"`, `"no"`, `"denies"`, `"not having"`, etc.
 
 ### Layer 2 — RAG-Grounded Answers
 
-Every LLM call injects the top-4 relevant passages from the drug's FDA label. The system prompt instructs Claude to answer *only* from this context and cite the source section.
+Every LLM call injects top-4 FDA label passages. The agent is instructed to answer only from this context and cite the source section.
 
 ```python
 ComplianceCitation(
@@ -153,143 +155,76 @@ ComplianceCitation(
 )
 ```
 
-If no FDA label is indexed for the drug, the agent flags the limitation explicitly rather than answering from training data.
+### Layer 3 — Output Guardrail
 
-### Layer 3 — Output Validation
-
-Agent responses are scanned before TTS for prohibited patterns. Violations are replaced with safe fallbacks — the patient never hears the original response.
+Agent responses are scanned before TTS. Violations are replaced with safe fallbacks — the patient never hears the original response.
 
 ```python
-DOSE_CHANGE_PATTERNS = [
-    "increase your dose", "take more", "taking more",
-    "double your dose", "skip your dose", ...
-]
-
-UNAUTHORIZED_CLAIM_PATTERNS = [
-    "will cure", "guaranteed to", "no side effects",
-    "completely safe", "better than", ...
-]
+DOSE_CHANGE_PATTERNS    = ["increase your dose", "take more", "double your dose", ...]
+UNAUTHORIZED_CLAIMS     = ["will cure", "guaranteed", "no side effects", ...]
 ```
 
 ---
 
 ## Eval Suite
 
-The eval suite tests all three compliance layers without a running server.
-
 ```bash
-python -m evals.run_evals           # 33 deterministic tests — ~0.1s
-python -m evals.run_evals --llm     # + LLM quality tests (live API calls)
-python -m evals.run_evals --rag     # + RAG retrieval quality (needs FDA PDFs)
+python -m evals.run_evals           # 33 deterministic tests — ~0.1s, no API keys
+python -m evals.run_evals --rag     # + RAG retrieval quality (37 total)
+python -m evals.run_evals --llm     # + live LLM response quality
 ```
 
-**The first run found 8 bugs.**
+**37/37 passing** across three layers.
 
-The original guardrail patterns were too literal — `"fainting"` didn't match `"fainted"`, `"dizziness"` didn't match `"dizzy"`, `"difficulty breathing"` didn't match `"can't breathe"`. All eight were patient safety misses: symptoms that should have escalated, didn't.
-
-The negation detection was added after the evals exposed a second class of failure: `"I don't have chest pain"` was triggering escalation because `"chest pain"` appeared as a substring. In a real deployment, that's a false alarm that erodes patient trust.
-
-**What the suite covers:**
+The first run found 8 bugs — original patterns were too literal. `"fainting"` didn't match `"fainted"`, `"dizziness"` didn't match `"dizzy"`, `"difficulty breathing"` didn't match `"can't breathe"`. All eight were patient safety misses: symptoms that should have escalated, didn't. Negation detection was also added after evals exposed false escalations on `"I don't have chest pain"`.
 
 | Suite | Cases | What it tests |
 |---|---|---|
 | Input guardrail | 15 | 5 high-severity, 3 medium, 4 benign, 3 negations |
 | Output guardrail | 11 | 8 violation patterns, 3 clean responses |
-| Journey stage inference | 7 | Day 0 → day 90 stage boundaries |
-| LLM quality (`--llm`) | 5 | Word count ≤80, no violations, latency p50/p95 |
-| RAG retrieval (`--rag`) | 3+ | Passage count, keyword relevance, <50ms target |
+| Journey stage | 7 | Day 0 → day 90 boundaries |
+| RAG retrieval | 4 | Passage count, keyword relevance, latency |
+| LLM quality | 5 | Word count, compliance, citations present |
 
-Exit code 1 on any failure — plugs directly into CI.
+Exit code 1 on failure — plugs into CI.
 
 ---
 
-## Multimodal Image Analysis
+## Running the Full Pipeline Test
 
-Patients can submit images mid-session — a rash, a medication bottle, unusual swelling.
-
-```
-POST /voice/analyze-image/{session_id}
-Content-Type: multipart/form-data
+```bash
+python test_pipeline.py
 ```
 
-The image is sent to Claude vision with the drug's FDA label passages for skin/reaction context. The response passes through the same output guardrail as voice turns. If a session is active, drug context and journey stage are pulled automatically.
+Exercises all layers without a microphone: text input → RAG → Input Guardrail → Claude → Output Guardrail → TTS. Covers both drugs across 5 turns including a crisis escalation.
 
-```json
-{
-  "session_id": "abc-123",
-  "drug": "lisinopril",
-  "journey_stage": "treatment_initiation",
-  "analysis": "The image shows a mild redness on the forearm. According to the FDA label adverse reactions section, skin rash is reported in a small percentage of patients. I'd recommend mentioning this to your care team at your next appointment. Does that help?",
-  "citations": [{"source_section": "Page 4 - Adverse Reactions", "source_text": "..."}],
-  "guardrail_fired": false,
-  "latency_ms": 380
-}
+```
+Turn 1  [lisinopril · treatment_initiation · day 7]
+  ✓ Input guardrail: SAFE
+  ✓ LLM responded in 4440ms · 4 citations
+  ✓ Output guardrail: clean
+  ✓ TTS: 7,503,872 audio bytes in 8808ms
+
+Turn 5  [lisinopril · adherence · day 20]
+  Patient: "I have severe chest pain and I'm sweating a lot."
+  ✓ Input guardrail fired correctly → escalation response
 ```
 
 ---
 
-## Latency Benchmarks
+## Running the Offline Demo
 
-Measured on Railway (1GB RAM):
+No API keys needed.
 
-| Stage | Target | Measured |
-|---|---|---|
-| Deepgram STT | < 200ms | ~180ms |
-| RAG retrieval (FAISS) | < 50ms | ~30ms |
-| Claude Haiku | < 400ms | ~320ms |
-| Cartesia TTS | < 200ms | ~160ms |
-| **Total (TTFA)** | **< 800ms** | **~690ms** |
-
-TTFA = Time to First Audio Byte from end of patient utterance.
-
----
-
-## Post-Call Summary
-
-Every session produces a structured JSON summary on disconnect:
-
-```json
-{
-  "session_id": "abc-123",
-  "patient_id": "patient-xyz",
-  "drug": "lisinopril",
-  "journey_stage": "treatment_initiation",
-  "adherence_signal": "at_risk",
-  "days_on_treatment": 14,
-  "topics_covered": ["missed_dose", "side_effects"],
-  "side_effects_mentioned": ["dizziness"],
-  "compliance_citations": [{
-    "claim": "Dizziness is a known side effect...",
-    "source_section": "Page 3 - Adverse Reactions",
-    "source_text": "In clinical trials, dizziness occurred in 12% of patients..."
-  }],
-  "guardrail_triggers": 0,
-  "escalate_to_human": false,
-  "escalation_flags": [],
-  "avg_response_latency_ms": 690
-}
+```bash
+python demo.py
 ```
 
-This is what pharma ops teams use — every conversation becomes structured, auditable data.
+Covers: input guardrail cases, negation detection, output guardrail, journey state machine, RAG retrieval — all locally, in ~5 seconds.
 
 ---
 
 ## Setup
-
-**Docker (recommended):**
-
-```bash
-git clone https://github.com/Ruchitha1608/helix-mini
-cd helix-mini
-
-cp .env.example .env
-# Add API keys: ANTHROPIC_API_KEY, DEEPGRAM_API_KEY, CARTESIA_API_KEY
-
-# Optional: add FDA label PDFs to data/fda_labels/ (e.g. lisinopril.pdf)
-# Download from https://labels.fda.gov/
-
-docker compose up
-```
 
 **Local:**
 
@@ -297,14 +232,21 @@ docker compose up
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+# Fill in: ANTHROPIC_API_KEY, DEEPGRAM_API_KEY, CARTESIA_API_KEY
 uvicorn main:app --reload
 ```
 
-**Run evals (no server needed, no API keys for guardrail tests):**
+**Docker:**
 
 ```bash
-python -m evals.run_evals
+cp .env.example .env
+# Fill in API keys
+docker compose up
 ```
+
+**Add a drug:**
+
+Drop any FDA label PDF into `data/fda_labels/<drug_name>.pdf`. The RAG service indexes it on startup.
 
 ---
 
@@ -320,27 +262,68 @@ python -m evals.run_evals
     "drug_name": "lisinopril",
     "dose_schedule": "10mg once daily",
     "days_on_treatment": 7,
-    "known_conditions": ["hypertension"],
-    "journey_stage": "treatment_initiation"
+    "known_conditions": ["hypertension"]
   }
 }
 ```
-
-`journey_stage` is optional — omit it and the server infers it from `days_on_treatment`.
 
 **Step 2 — Receive ready:**
 ```json
 {"type": "ready", "message": "Helix ready — lisinopril / stage: treatment_initiation", "journey_stage": "treatment_initiation"}
 ```
 
-**Step 3 — Stream audio:** Send raw PCM 16kHz mono bytes
+**Step 3 — Stream audio:** raw PCM 16kHz mono bytes
 
 **Step 4 — Receive events:**
 ```json
 {"type": "transcript", "text": "I've been feeling dizzy lately"}
 {"type": "response", "text": "Dizziness is listed in the FDA label...", "escalate": false}
-// followed by raw audio bytes
-{"type": "summary", "data": {...}}  // on WebSocket disconnect
+// followed by raw audio bytes (TTS)
+{"type": "summary", "data": {...}}   // on disconnect
+```
+
+---
+
+## Multimodal Image Analysis
+
+```
+POST /voice/analyze-image/{session_id}
+Content-Type: multipart/form-data
+```
+
+Patient submits a photo (rash, medication bottle) mid-session. Claude Vision analyzes it with FDA label context. Response passes through the same output guardrail.
+
+```json
+{
+  "drug": "lisinopril",
+  "journey_stage": "treatment_initiation",
+  "analysis": "The image shows mild redness on the forearm. According to the FDA label adverse reactions section, skin rash is reported in a small percentage of patients...",
+  "citations": [{"source_section": "Page 4 - Adverse Reactions", "source_text": "..."}],
+  "guardrail_fired": false,
+  "latency_ms": 380
+}
+```
+
+---
+
+## Post-Call Summary
+
+Emitted as JSON on every WebSocket disconnect:
+
+```json
+{
+  "session_id": "abc-123",
+  "drug": "lisinopril",
+  "journey_stage": "treatment_initiation",
+  "adherence_signal": "at_risk",
+  "days_on_treatment": 14,
+  "topics_covered": ["missed_dose", "side_effects"],
+  "side_effects_mentioned": ["dizziness"],
+  "compliance_citations": [{"source_section": "Page 3 - Adverse Reactions", "...": "..."}],
+  "guardrail_triggers": 0,
+  "escalate_to_human": false,
+  "avg_response_latency_ms": 690
+}
 ```
 
 ---
@@ -349,17 +332,16 @@ python -m evals.run_evals
 
 | Concern | Current | Production |
 |---|---|---|
-| Audio | WebSocket PCM | WebRTC or Twilio Media Streams |
-| STT | Deepgram live | Deepgram + fallback (AssemblyAI) |
-| LLM | Claude Haiku | Claude Haiku + prompt caching for common Qs |
-| Vector store | In-memory FAISS | Pinecone or pgvector (persistent, multi-drug) |
+| Audio transport | WebSocket PCM | WebRTC or Twilio Media Streams |
+| Vector store | In-memory FAISS | pgvector or Pinecone (persistent, multi-drug) |
 | Sessions | In-memory dict | Redis with TTL |
 | Post-call | Sync on disconnect | Async job queue (Celery/Redis) |
-| Guardrails | Pattern matching | LLM-as-judge eval pipeline for drift detection |
+| Guardrails | Pattern matching | LLM-as-judge eval pipeline for drift |
 | Observability | Logging | Datadog APM + latency dashboards |
 | Telephony | WebSocket | Twilio Voice + SIP trunking |
 | Journey stage | Inferred from days | Pulled from patient CRM/EHR |
-| Multi-language | English only | Deepgram + Cartesia multilingual models |
+| Multi-language | English only | Deepgram + Cartesia multilingual |
+| LLM | Claude Haiku | Haiku + prompt caching for common questions |
 
 ---
 
